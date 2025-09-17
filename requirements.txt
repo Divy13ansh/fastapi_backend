@@ -9,3 +9,5 @@ sentence-transformers
 starlette
 uvicorn
 pydantic
+python-dotenv
+typing-extensions
