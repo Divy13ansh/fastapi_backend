@@ -8,10 +8,24 @@ from langchain.chains import RetrievalQA
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
+
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 def get_qdrant_client():
+    url = os.getenv("QDRANT_URL")
+    api_key = os.getenv("QDRANT_API_KEY")
+    
+    if not url:
+        raise ValueError("QDRANT_URL environment variable is not set")
+    if not api_key:
+        raise ValueError("QDRANT_API_KEY environment variable is not set")
+        
     return QdrantClient(
-        url=os.getenv("QDRANT_URL"),
-        api_key=os.getenv("QDRANT_API_KEY"),
+        url=url,
+        api_key=api_key,
     )
 
 def get_embeddings():
@@ -20,11 +34,16 @@ def get_embeddings():
 
 def get_vector_store(client, embeddings):
     collection_name = os.getenv("QDRANT_COLLECTION", "my_json_collection")
-    return QdrantVectorStore(
-        client=client,
-        embedding=embeddings,
-        collection_name=collection_name
-    )
+    try:
+        return QdrantVectorStore(
+            client=client,  # Use the passed client instead of creating new one
+            embedding=embeddings,  # Use the passed embeddings instead of creating new ones
+            collection_name=collection_name
+        )
+    except Exception as e:
+        if "connection" in str(e).lower():
+            raise ConnectionError(f"Could not connect to Qdrant server: {str(e)}")
+        raise
 
 def get_llm():
     return AzureChatOpenAI(
