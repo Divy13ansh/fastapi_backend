@@ -1,93 +1,100 @@
-
-import json
-import os
-from langchain.docstore.document import Document
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai import AzureChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-
-
+import uuid
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
+from sqlmodel import Session, select
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-def get_qdrant_client():
-    url = os.getenv("QDRANT_URL")
-    api_key = os.getenv("QDRANT_API_KEY")
-    
-    if not url:
-        raise ValueError("QDRANT_URL environment variable is not set")
-    if not api_key:
-        raise ValueError("QDRANT_API_KEY environment variable is not set")
-        
-    return QdrantClient(
-        url=url,
-        api_key=api_key,
-    )
+from db import ChatSession, get_db, init_db, Message
+import db as db
+from json_query import get_qdrant_client, get_embeddings, get_vector_store, get_llm, get_qa_chain
 
-def get_embeddings():
-    model_name = os.getenv("EMBEDDINGS_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-    return HuggingFaceEmbeddings(model_name=model_name)
+class AppState:
+    def __init__(self):
+        self.client = None
+        self.embeddings = None
+        self.vector_store = None
+        self.llm = None
+        self.qa_chain = None
 
-def get_vector_store(client, embeddings):
-    collection_name = os.getenv("QDRANT_COLLECTION", "my_json_collection")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize resources
     try:
-        return QdrantVectorStore(
-            client=client,  # Use the passed client instead of creating new one
-            embedding=embeddings,  # Use the passed embeddings instead of creating new ones
-            collection_name=collection_name
-        )
+        app_state.client = get_qdrant_client()
+        app_state.embeddings = get_embeddings()
+        app_state.vector_store = get_vector_store(app_state.client, app_state.embeddings)
+        app_state.llm = get_llm()
+        app_state.qa_chain = get_qa_chain(app_state.llm, app_state.vector_store)
+        print("✅ All resources initialized successfully")
+        yield
     except Exception as e:
-        if "connection" in str(e).lower():
-            raise ConnectionError(f"Could not connect to Qdrant server: {str(e)}")
+        print(f"❌ Error initializing resources: {str(e)}")
         raise
+    finally:
+        # Shutdown: Clean up resources
+        if app_state.client:
+            app_state.client.close()
 
-def get_llm():
-    return AzureChatOpenAI(
-        azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01"),
-        temperature=float(os.getenv("AZURE_OPENAI_TEMPERATURE", "0")),
-    )
+app = FastAPI(title="RAG Chat API — End-to-end", lifespan=lifespan)
+app_state = AppState()
 
-def get_qa_chain(llm, vector_store):
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=vector_store.as_retriever(search_kwargs={"k": 5}),
-        return_source_documents=True,
-    )
+db.init_db()
 
-def query_loop():
-    client = get_qdrant_client()
-    embeddings = get_embeddings()
-    vector_store = get_vector_store(client, embeddings)
-    llm = get_llm()
-    qa_chain = get_qa_chain(llm, vector_store)
+# Request/Response schemas
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None
+    query: str
 
-    print("✅ Qdrant + RAG pipeline ready. Ask me anything (type 'exit' to quit).")
+class Source(BaseModel):
+    page: Optional[str]
+    snippet: str
 
-    while True:
-        query = input("\nEnter your query: ")
-        if query.lower() in ["exit", "quit", "q"]:
-            break
+class ChatResponse(BaseModel):
+    session_id: str
+    answer: str
+    sources: List[Source]
 
-        # Step 1: check retriever scores
-        results = vector_store.similarity_search_with_score(query, k=3)
-        print(max(score for _, score in results))
-        print()
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest, db: Session = Depends(get_db)):
+    session_id = req.session_id or str(uuid.uuid4())
+
+    # Save session row if new
+    existing = db.exec(select(ChatSession).where(ChatSession.session_id == session_id)).first()
+    if not existing:
+        db.add(ChatSession(session_id=session_id))
+        db.commit()
+
+    try:
+        # Use the global instances instead of creating new ones
+        results = app_state.vector_store.similarity_search_with_score(req.query, k=3)
         if not results or max(score for _, score in results) < 0.37:
-            print("❌ I don’t know based on the stored documents.")
-            continue
+            answer = "I don't know based on the stored documents."
+            sources = []
+        else:
+            out = app_state.qa_chain.invoke({"query": req.query})
+            answer = out.get("result") or out.get("answer") or ""
+            sources = []
+            for doc in out.get("source_documents", []):
+                page = doc.metadata.get("pages", "N/A")
+                if isinstance(page, list):
+                    page = ", ".join(str(p) for p in page)
+                sources.append({
+                    "page": page,
+                    "snippet": doc.page_content[:400]
+                })
 
-        # Step 2: run through RAG with strict prompt
-        result = qa_chain({"query": query})
-        print("\n📌 Answer:", result["result"])
-        doc = result["source_documents"][0]
-        print("\n📖 Source Pages:", [doc.metadata.get("pages")])
+        # persist messages
+        db.add(Message(session_id=session_id, role="user", content=req.query))
+        db.add(Message(session_id=session_id, role="assistant", content=answer))
+        db.commit()
 
-if __name__ == "__main__":
-    query_loop()
+        return ChatResponse(session_id=session_id, answer=answer, sources=sources)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
